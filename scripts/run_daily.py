@@ -3,7 +3,7 @@
 """每日自动化主流程：抓取 → LLM 分析 → 更新跟踪表 → 渲染 → 生成日报 → 可选推送。
 
 用法：
-    python scripts/run_daily.py                      # 默认分析当日（北京时间）
+    python scripts/run_daily.py                      # 默认分析昨天（北京时间，晨报模式）
     python scripts/run_daily.py --date 2026-08-12    # 指定日期
     python scripts/run_daily.py --mock               # 内置样例响应测试全流程（不调 API，输出写临时目录）
     python scripts/run_daily.py --dry-run            # 真实抓取/分析，但输出写临时目录，不改真实数据
@@ -27,6 +27,14 @@
 - 次要 3 默认“昨日”改用 Asia/Shanghai 时区。
 - 次要 7 --mock/--dry-run 输出写入临时目录，不污染真实数据。
 - 次要 8 默认分析日期从“昨日”改为“当日”（配合每晚 20:00 定时，直接分析当天联播）。
+- 2026-10-20 晨报模式：默认日期改回“昨日”。GitHub 调度延迟恶化（4-9h）使 20:00 定时
+       多次拖过北京时间 0 点，分析“未播出日期”致两数据源 404 全灭（2026-10-04~19 连续失败）。
+       改为次日早晨分析昨天后，数据必然已发布，调度延迟只影响时效不影响成败。
+- 2026-10-20 抓取失败透出 stdout 尾部：抓取脚本的 URL/HTTP 状态/诊断都在 stdout，
+       原实现只显示 stderr，失败时只剩一句“两个数据源均失败”，无法定位原因。
+- 2026-10-20 LLM 校验自动修正：重试后仍不过时，可机械修复的错误（signals 超上限 4 条）
+       按优先级截断后继续出报，不再整天空窗（2026-10-17/18 因 signals=5 连续空窗的教训）；
+       修正记录进日志并随推送通知上报。无法修正的错误仍硬失败。
 - 安全 5/6 LLM 错误日志脱敏；webhook 协议校验。
 """
 
@@ -122,7 +130,12 @@ def fetch_transcript(target_date):
            "--date", target_date, "--outdir", PATHS["raw"]]
     res = run(cmd, timeout=300)
     if res.returncode != 0:
-        raise SystemExit(f"抓取失败：{_redact(res.stderr, [env_or('LLM_API_KEY')])[-800:]}")
+        secrets = [env_or('LLM_API_KEY')]
+        # stdout 与 stderr 尾部都透出：抓取脚本的过程日志（访问的 URL、HTTP 状态、
+        # 诊断摘要）打印在 stdout，只看 stderr 会丢失失败原因（2026-10 教训）。
+        tail = ("\n--- stdout ---\n" + _redact((res.stdout or "")[-1200:], secrets)
+                + "\n--- stderr ---\n" + _redact((res.stderr or "")[-800:], secrets))
+        raise SystemExit(f"抓取失败：{tail}")
     path = os.path.join(PATHS["raw"], f"xwlb_{target_date.replace('-', '')}_text.md")
     if not os.path.exists(path):
         raise SystemExit(f"抓取完成但未找到输出：{path}")
@@ -350,7 +363,10 @@ def validate_llm_result(result):
                 if "category" in nt and not isinstance(nt["category"], str):
                     errors.append(f"{tag}.new_theme.category 必须是字符串")
             else:
-                tid = sig["existing_theme_id"]
+                # 用 .get 而非下标：信号既无 new_theme 又无 existing_theme_id 时，
+                # 上面的二选一校验已记错误，这里继续走校验并靠类型检查拦下，
+                # 不再 KeyError 崩溃（2026-10-20 修复）。
+                tid = sig.get("existing_theme_id")
                 if not (isinstance(tid, int) or (isinstance(tid, str) and tid.strip().isdigit())):
                     errors.append(f"{tag}.existing_theme_id 必须是整数或数字字符串：{tid!r}")
                 upd = sig.get("update", {})
@@ -422,6 +438,26 @@ def validate_llm_result(result):
 
 
 # ---------------------------------------------------------------- 跟踪表更新
+
+def repair_llm_result(result, errors):
+    """对可机械修复的校验错误就地修正，返回 (result, 修正说明列表)。
+
+    目前只处理一类：signals 数量超过上限 4 条 → 截断到前 4 条。Prompt 要求模型
+    按"层级高、具体性强、验证窗口近"优先排序，越靠后越次要，截断即保留最高优先级。
+    其余错误（结构缺失、不可证伪条件等）无法可靠地机械修复，仍由调用方决定
+    回传 LLM 重试或硬失败。
+    （2026-10-17/18 DeepSeek 连续两天返回 5 条 signals，重试后仍 5 条，
+      旧逻辑直接退出致整天无日报，故引入本函数。）
+    """
+    repairs = []
+    signals = result.get("signals")
+    for err in errors:
+        m = re.match(r"signals 数量 (\d+) 超过上限 4 条", err)
+        if m and isinstance(signals, list) and len(signals) > 4:
+            del signals[4:]
+            repairs.append(f"signals 数量 {m.group(1)} 超上限，已按优先级截断为 4 条")
+    return result, repairs
+
 
 def apply_result(doc, result, target_date):
     """把 LLM 返回的 signals 应用到跟踪表；重算 stats 后原子写回。"""
@@ -912,8 +948,10 @@ def main():
         tmp_root = setup_temp_paths()
         print(f"[dry-run] 输出写入临时目录：{tmp_root}")
 
-    # 默认“当日”按北京时间计算（每晚 20:00 运行，直接分析当天已播完的联播）
-    target_date = args.date or datetime.now(CN_TZ).strftime("%Y-%m-%d")
+    # 晨报模式（2026-10-20）：自动化在次日早晨运行，默认分析"昨天"（节目已播出、数据源已发布）。
+    # workflow 会显式传 --date；此默认值保证手动运行与自动化口径一致。
+    target_date = args.date or (datetime.now(CN_TZ) - timedelta(days=1)).strftime("%Y-%m-%d")
+    repairs = []  # LLM 输出自动修正记录，随日志与推送通知上报
     print(f"[1/7] 日期：{target_date}")
 
     if args.mock:
@@ -988,8 +1026,17 @@ def main():
                     retry_error = "；".join(errors[:5])
                     print(f"        [validate] 校验失败，回传错误重试一次：{retry_error}")
                     continue
-                raise SystemExit(
-                    "LLM 输出连续两次校验失败：\n  - " + "\n  - ".join(errors))
+                # 自动修正（2026-10-20）：重试后仍不过时，能机械修复的错误修复后继续出报，
+                # 不再因格式瑕疵整天空窗；无法修复的错误维持硬失败，保证质量底线。
+                result, repairs = repair_llm_result(result, errors)
+                if repairs:
+                    errors, fix_warnings = validate_llm_result(result)
+                    for w in fix_warnings:
+                        print(f"        [validate] 警告（修正后复检）：{w}")
+                    print(f"【警告】LLM 输出已自动修正：{'；'.join(repairs)}（已随推送通知上报）")
+                if errors:
+                    raise SystemExit(
+                        "LLM 输出连续两次校验失败：\n  - " + "\n  - ".join(errors))
             break
 
     if not result.get("report_markdown"):
@@ -1059,7 +1106,11 @@ def main():
     if dry_run:
         print("        dry-run：跳过真实推送")
     else:
-        notify(report_path, summary=result.get("report_summary"))
+        summary = result.get("report_summary")
+        if repairs:
+            note = "【注意】本次分析 LLM 输出经自动修正：" + "；".join(repairs)
+            summary = f"{summary}\n\n{note}" if summary else note
+        notify(report_path, summary=summary)
 
     if dry_run:
         print(f"完成（dry-run）：{report_path}")

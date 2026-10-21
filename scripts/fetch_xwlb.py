@@ -21,6 +21,11 @@
 - 次要 6 缓存一致性：JSON 在而 MD 缺失时补写 MD，消除中断死锁；
 - P1-3 关键文件原子写入（common.write_atomic）；
 - 安全 1 mrxwlb 改用 HTTPS，失败时回退 HTTP（仅告警）。
+- 2026-10-20 合并 fix/fetch-diagnostics 并修正：失败/404/解析退化时打印诊断
+  （HTTP 状态、内容类型、响应体前 400 字摘要），配合 run_daily 透出 stdout 尾部，
+  在 Actions 日志即可区分"日期未发布/被风控/页面改版"等不同死因。
+  相对原补丁的修正：① 诊断对 404 也打印（我们的主要失败模式）；② 响应体直接由
+  已读取的字节生成（原实现重复 read 已消费流，摘要恒为空）；③ diagnose 默认开启。
 """
 
 import argparse
@@ -48,9 +53,34 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.normpath(os.path.join(BASE_DIR, "..", "data", "raw"))
 
 
-def fetch_url(url, retries=3, timeout=30, delay=2):
-    """带重试与 gzip 处理的抓取；404 返回 None，其余异常抛给上层。"""
+def _diag(url, status, headers, body):
+    """汇总一次响应的诊断信息（HTTP 状态、内容类型、响应体长度与前 400 字摘要）。
+
+    失败时打印它，可区分"日期未发布（404）/被风控（403）/页面改版（200 但结构不符）"
+    等不同死因（2026-10-20 合入 fix/fetch-diagnostics 并修正：诊断随失败透出到 Actions 日志）。
+    """
+    content_type = headers.get("Content-Type", "") if hasattr(headers, "get") else ""
+    body = body or b""
+    preview = body[:400].decode("utf-8", errors="replace").replace("\r", " ").replace("\n", " ")
+    if len(preview) > 400:
+        preview = preview[:397] + "..."
+    return {
+        "url": url,
+        "status": status,
+        "content_type": content_type,
+        "body_len": len(body),
+        "preview": preview,
+    }
+
+
+def fetch_url(url, retries=3, timeout=30, delay=2, diagnose=True):
+    """带重试与 gzip 处理的抓取；404 返回 None，其余异常抛给上层。
+
+    diagnose=True 时收集每次响应的诊断信息，失败/404 时随 [fetch] 日志打印，
+    便于在 Actions 日志直接定位上游变化。
+    """
     last_err = None
+    diagnostics = []
     for attempt in range(1, retries + 1):
         try:
             req = urllib.request.Request(
@@ -66,10 +96,20 @@ def fetch_url(url, retries=3, timeout=30, delay=2):
                 data = resp.read()
                 if resp.headers.get("Content-Encoding") == "gzip":
                     data = gzip.decompress(data)
+                if diagnose:
+                    diagnostics.append(_diag(url, getattr(resp, "status", "?"), resp.headers, data))
                 return data.decode("utf-8", errors="replace")
         except urllib.error.HTTPError as e:
+            try:
+                err_body = e.read()
+            except Exception:
+                err_body = b""
+            if diagnose:
+                diagnostics.append(_diag(url, e.code, e.headers, err_body))
             if e.code == 404:
                 print(f"    [fetch] 404: {url}")
+                if diagnose and diagnostics:
+                    print(f"    [fetch] diagnostic: {diagnostics[-1]}")
                 return None
             if e.code in (403, 503) and attempt < retries:
                 print(f"    [fetch] HTTP {e.code}, attempt {attempt}/{retries}, wait {delay*10}s...")
@@ -77,6 +117,8 @@ def fetch_url(url, retries=3, timeout=30, delay=2):
                 last_err = e
                 continue
             print(f"    [fetch] HTTP {e.code}: {url}")
+            if diagnose and diagnostics:
+                print(f"    [fetch] diagnostic: {diagnostics[-1]}")
             last_err = e
             break
         except Exception as e:
@@ -85,6 +127,8 @@ def fetch_url(url, retries=3, timeout=30, delay=2):
             if attempt < retries:
                 time.sleep(delay)
     if last_err:
+        if diagnose and diagnostics:
+            print(f"    [fetch] diagnostic: {diagnostics[-1]}")
         raise last_err
     return None
 
@@ -136,7 +180,12 @@ def cctv_day_page(date_str):
     raw = fetch_url(url)
     if not raw:
         return [], raw
-    return parse_cctv_day_page(raw), raw
+    items = parse_cctv_day_page(raw)
+    if not items:
+        # 页面可达但解析不到条目：多半是上游改版或风控页，透出响应预览便于定位
+        preview = re.sub(r"\s+", " ", raw[:300])
+        print(f"[CCTV] 每日页响应预览（排查改版/风控）: {preview}")
+    return items, raw
 
 
 def cctv_item_text(url):
@@ -195,6 +244,8 @@ def parse_mrxwlb(raw):
     i = raw.find('class="entry-content"')
     if i < 0:
         print("[MRXWLB] 未找到 entry-content")
+        preview = re.sub(r"\s+", " ", raw[:300])
+        print(f"[MRXWLB] 页面响应预览（排查改版/风控）: {preview}")
         return []
     content = raw[i:]
     end = content.find("<!-- .entry-content -->")
