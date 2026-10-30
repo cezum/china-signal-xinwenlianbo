@@ -1,7 +1,7 @@
 {
   "meta": {
     "version": "1.2",
-    "generated_at": "2026-10-28",
+    "generated_at": "2026-10-29",
     "source_file": "reference/initial_signal_tracking_table.md (v1) + 8/12-8/17日度更新",
     "data_range": "2026-03-01 至 2026-08-16",
     "headline_total": 1795,
@@ -350,7 +350,7 @@
         "level": "A",
         "novelty": "PROGRESS",
         "specificity": "S2",
-        "policy_window": "接近",
+        "policy_window": "开放",
         "verification_window": "MID",
         "narrative_framework": "发展框架"
       },
@@ -370,7 +370,7 @@
         "source": "联播",
         "date": "根据惯例预计2026年10月前后",
         "grace_period": "+30天",
-        "status": "跟踪中"
+        "status": "已验证"
       },
       "category": "规划体系与顶层设计",
       "lifecycle": [
@@ -389,6 +389,13 @@
           "to": null,
           "evidence": "联播第5条：委员长会议决定十四届全国人大常委会第二十四次会议8月25日至28日举行，将审议多项法律草案",
           "reason": "立法议程推进，可能涉及规划法等相关法律"
+        },
+        {
+          "date": "2026-10-29",
+          "type": "verify",
+          "action": "验证通过：二十届五中全会公报发布",
+          "evidence": "联播第1条：中国共产党第二十届中央委员会第五次全体会议公报（2026年10月26日至29日在北京举行），审议通过《中共中央关于持之以恒推进全面从严治党若干重大问题的决定》，明确“十四五”圆满收官、“十五五”开局良好，部署岁末年初经济工作，决定二十一大2027年下半年召开",
+          "reason": "验证条件“二十届五中全会公报发布”已满足，主题由跟踪中转为已验证"
         }
       ],
       "framework_evidence": "发展框架：命中'现代化'等词典词"
@@ -5446,8 +5453,8 @@
       "S2": 13
     },
     "by_policy_window": {
-      "开放": 71,
-      "接近": 7,
+      "开放": 72,
+      "接近": 6,
       "封闭": 1
     },
     "by_verification_window": {
